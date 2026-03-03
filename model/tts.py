@@ -1,0 +1,213 @@
+import math
+import random
+
+import torch
+
+from model import monotonic_align
+from model.base import BaseModule
+from model.text_encoder import TextEncoder 
+from model.utils import sequence_mask, generate_path, duration_loss, fix_len_compatibility
+
+from model.como import Como
+from model.como_ect import ComoECT
+# from model.como_zero import Como
+
+class Comospeech(BaseModule):
+    def __init__(self, n_vocab, n_spks, spk_emb_dim, n_enc_channels, filter_channels, filter_channels_dp, 
+                 n_heads, n_enc_layers, enc_kernel, enc_dropout, window_size, 
+                 n_feats, teacher=True):
+        super(Comospeech, self).__init__()
+        self.n_vocab = n_vocab
+        self.n_spks = n_spks
+        self.spk_emb_dim = spk_emb_dim
+        self.n_enc_channels = n_enc_channels
+        self.filter_channels = filter_channels
+        self.filter_channels_dp = filter_channels_dp
+        self.n_heads = n_heads
+        self.n_enc_layers = n_enc_layers
+        self.enc_kernel = enc_kernel
+        self.enc_dropout = enc_dropout
+        self.window_size = window_size
+        self.n_feats = n_feats
+        self.teacher = teacher
+ 
+        if n_spks > 1:
+            self.spk_emb = torch.nn.Embedding(n_spks, spk_emb_dim)
+        self.encoder = TextEncoder(n_vocab, n_feats, n_enc_channels, 
+                                   filter_channels, filter_channels_dp, n_heads, 
+                                   n_enc_layers, enc_kernel, enc_dropout, window_size)
+       
+        if teacher:
+            self.decoder = Como(teacher)
+        else:
+            self.decoder = ComoECT()  
+
+    @torch.no_grad()
+    def forward(self, x, x_lengths, n_timesteps, spk=None, length_scale=1.0, use_ema=False, temperature=1.0, use_ect_generator=False):
+        """
+        Generates mel-spectrogram from text. Returns:
+            1. encoder outputs
+            2. decoder outputs
+            3. generated alignment
+        
+        Args:
+            x (torch.Tensor): batch of texts, converted to a tensor with phoneme embedding ids.
+            x_lengths (torch.Tensor): lengths of texts in batch.
+            n_timesteps (int): number of steps to use for reverse diffusion in decoder.
+            spk (torch.Tensor, optional): speaker ids for multi-speaker model.
+            length_scale (float, optional): controls speech pace.
+                Increase value to slow down generated speech and vice versa.
+            use_ema (bool, optional): whether to use EMA model for inference in ECT mode.
+            temperature (float, optional): controls noise level in sampling.
+                Lower values produce more deterministic outputs, higher values more diverse.
+            use_ect_generator (bool, optional): whether to use ECT_generator for inference in ECT mode.
+                When True, uses ECT_generator; when False, uses CT_sampler (default).
+        """
+        x, x_lengths = self.relocate_input([x, x_lengths])
+
+        if self.n_spks > 1:
+            # Get speaker embedding
+            spk = self.spk_emb(spk)
+
+        # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
+        mu_x, logw, x_mask = self.encoder(x, x_lengths, spk)
+
+        w = torch.exp(logw) * x_mask
+        w_ceil = torch.ceil(w) * length_scale
+        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        y_max_length = int(y_lengths.max())
+        y_max_length_ = fix_len_compatibility(y_max_length)
+
+        # Using obtained durations `w` construct alignment map `attn`
+        y_mask = sequence_mask(y_lengths, y_max_length_).unsqueeze(1).to(x_mask.dtype)
+        attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
+        attn = generate_path(w_ceil.squeeze(1), attn_mask.squeeze(1)).unsqueeze(1)
+
+        # Align encoded text and get mu_y
+        mu_y = torch.matmul(attn.squeeze(1).transpose(1, 2), mu_x.transpose(1, 2))
+        mu_y = mu_y.transpose(1, 2)
+        encoder_outputs = mu_y[:, :, :y_max_length]
+
+        # 根据不同的模型类型和参数选择不同的调用方式
+        if isinstance(self.decoder, Como):
+            # Teacher模型的调用方式
+            decoder_outputs = self.decoder(mu_y, y_mask, mu_y, t_steps=n_timesteps, infer=True)
+        elif isinstance(self.decoder, ComoECT):
+            # 在ECT模式下，确保使用EMA模型进行推理
+            if use_ema:
+                print(f"使用EMA模型推理 - 阶段: {self.decoder.stage}, 比例: {self.decoder.ratio:.4f}")
+            else:
+                print(f"使用主网络推理 - 阶段: {self.decoder.stage}, 比例: {self.decoder.ratio:.4f}")
+            
+            # 创建初始噪声 - 使用纯噪声，不加条件
+            noise = torch.randn_like(mu_y)
+            
+            # 选择采样器信息
+            sampler_info = "ECT_generator" if use_ect_generator else "CT_sampler"
+            print(f"使用{sampler_info}采样器 - 步数: {n_timesteps}")
+            
+            # ComoECT模型调用方式
+            decoder_outputs = self.decoder(
+                noise, y_mask, mu_y, 
+                t_steps=n_timesteps, 
+                infer=True,  # 明确指定为推理模式
+                use_ema=use_ema,  # 是否使用EMA模型
+                use_ect_generator=use_ect_generator  # 是否使用ECT_generator
+            )
+        else:
+            # 默认调用方式
+            decoder_outputs = self.decoder(mu_y, y_mask, mu_y, t_steps=n_timesteps, infer=True)
+        
+        decoder_outputs = decoder_outputs[:, :, :y_max_length]
+
+        return encoder_outputs, decoder_outputs, attn[:, :, :y_max_length]
+
+    def compute_loss(self, x, x_lengths, y, y_lengths, spk=None, out_size=None):
+        """
+        Computes 3 losses:
+            1. duration loss: loss between predicted token durations and those extracted by Monotinic Alignment Search (MAS).
+            2. prior loss: loss between mel-spectrogram and encoder outputs.
+            3. diffusion loss: loss between gaussian noise and its reconstruction by diffusion-based decoder.
+            
+        Args:
+            x (torch.Tensor): batch of texts, converted to a tensor with phoneme embedding ids.
+            x_lengths (torch.Tensor): lengths of texts in batch.
+            y (torch.Tensor): batch of corresponding mel-spectrograms.
+            y_lengths (torch.Tensor): lengths of mel-spectrograms in batch.
+            out_size (int, optional): length (in mel's sampling rate) of segment to cut, on which decoder will be trained.
+                Should be divisible by 2^{num of UNet downsamplings}. Needed to increase batch size.
+        """
+        x, x_lengths, y, y_lengths = self.relocate_input([x, x_lengths, y, y_lengths])
+
+        if self.n_spks > 1:
+            # Get speaker embedding
+            spk = self.spk_emb(spk)
+        
+        # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
+        # with torch.no_grad():
+        mu_x, logw, x_mask = self.encoder(x, x_lengths, spk)
+        y_max_length = y.shape[-1]
+
+        y_mask = sequence_mask(y_lengths, y_max_length).unsqueeze(1).to(x_mask)
+        attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
+
+        # Use MAS to find most likely alignment `attn` between text and mel-spectrogram
+        with torch.no_grad(): 
+            const = -0.5 * math.log(2 * math.pi) * self.n_feats
+            factor = -0.5 * torch.ones(mu_x.shape, dtype=mu_x.dtype, device=mu_x.device)
+            y_square = torch.matmul(factor.transpose(1, 2), y ** 2)
+            y_mu_double = torch.matmul(2.0 * (factor * mu_x).transpose(1, 2), y)
+            mu_square = torch.sum(factor * (mu_x ** 2), 1).unsqueeze(-1)
+            log_prior = y_square - y_mu_double + mu_square + const
+
+            attn = monotonic_align.maximum_path(log_prior, attn_mask.squeeze(1))
+            attn = attn.detach()
+
+        # Compute loss between predicted log-scaled durations and those obtained from MAS
+        logw_ = torch.log(1e-8 + torch.sum(attn.unsqueeze(1), -1)) * x_mask
+        dur_loss = duration_loss(logw, logw_, x_lengths)
+
+        # Cut a small segment of mel-spectrogram in order to increase batch size
+        if not isinstance(out_size, type(None)):
+            max_offset = (y_lengths - out_size).clamp(0)
+            offset_ranges = list(zip([0] * max_offset.shape[0], max_offset.cpu().numpy()))
+            out_offset = torch.LongTensor([
+                torch.tensor(random.choice(range(start, end)) if end > start else 0)
+                for start, end in offset_ranges
+            ]).to(y_lengths)
+            
+            attn_cut = torch.zeros(attn.shape[0], attn.shape[1], out_size, dtype=attn.dtype, device=attn.device)
+            y_cut = torch.zeros(y.shape[0], self.n_feats, out_size, dtype=y.dtype, device=y.device)
+            y_cut_lengths = []
+            for i, (y_, out_offset_) in enumerate(zip(y, out_offset)):
+                y_cut_length = out_size + (y_lengths[i] - out_size).clamp(None, 0)
+                y_cut_lengths.append(y_cut_length)
+                cut_lower, cut_upper = out_offset_, out_offset_ + y_cut_length
+                y_cut[i, :, :y_cut_length] = y_[:, cut_lower:cut_upper]
+                attn_cut[i, :, :y_cut_length] = attn[i, :, cut_lower:cut_upper]
+            y_cut_lengths = torch.LongTensor(y_cut_lengths)
+            y_cut_mask = sequence_mask(y_cut_lengths).unsqueeze(1).to(y_mask)
+            
+            attn = attn_cut
+            y = y_cut
+            y_mask = y_cut_mask
+
+        # Align encoded text with mel-spectrogram and get mu_y segment
+        mu_y = torch.matmul(attn.squeeze(1).transpose(1, 2), mu_x.transpose(1, 2))
+        mu_y = mu_y.transpose(1, 2)
+
+        # 计算diffusion损失
+        if not self.teacher:
+            # ECT模式下，主网络用于训练，EMA网络用作目标
+            # 显式设置infer=False，确保调用训练路径
+            diff_loss = self.decoder(y, y_mask, mu_y, infer=False)
+        else:
+            # 教师模式使用正常diffusion loss
+            diff_loss = self.decoder(y, y_mask, mu_y)
+
+        # Compute loss between aligned encoder outputs and mel-spectrogram
+        prior_loss = torch.sum(0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask)
+        prior_loss = prior_loss / (torch.sum(y_mask) * self.n_feats)
+        
+        return dur_loss, prior_loss, diff_loss
+ 
