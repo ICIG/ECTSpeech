@@ -31,7 +31,7 @@ window_size = 4
 teacher = True    # true for Pre_model model, false for consistency tuning
 
 # ECT微调参数
-teacher_model_path = '/root/shared-nvme/ECT/ECTSpeech_V9/logs/pre_model/model_2070.pt'  # 预训练教师模型路径
+teacher_model_path = ''  # 预训练教师模型路径
 double_every = 10    # 每隔10个epoch更新一次微调阶段
 use_fp16 = False    # 是否使用混合精度训练，可能在某些GPU上提高稳定性
 ect_initial_stage = 0  # 初始微调阶段
