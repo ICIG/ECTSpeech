@@ -80,11 +80,11 @@ sigma_max = 80      # 最大噪声水平
 rho = 7             # EDM噪声调度参数
 
 # training parameters
-log_dir = 'logs/ect_model_2'  # 日志目录
+log_dir = 'logs/Pre_model'  # 日志目录,ect存放为'logs/ect'
 test_size = 2
-n_epochs = 230     # 训练总轮数
+n_epochs = 2300     # 训练总轮数,ect为230
 batch_size = 16     # 批量大小
-learning_rate = 1e-5  # 学习率 ect学习率1e-5
+learning_rate = 1e-4  # 学习率，Pre_model学习率1e-4，ect学习率1e-5
 seed = 1234
 save_every = 1      # 每1个epoch保存一次模型
 out_size = fix_len_compatibility(2*22050//256)
