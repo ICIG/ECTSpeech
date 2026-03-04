@@ -1,6 +1,3 @@
-下面是完整内容，已加入数据集网址，并说明将数据集放在 `ECTSpeech` 目录下并重命名为 `DUMMY`。
-
-````markdown
 # ECTSpeech
 
 ## Prepare
