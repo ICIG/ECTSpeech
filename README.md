@@ -1,3 +1,6 @@
+下面是完整内容，已加入数据集网址，并说明将数据集放在 `ECTSpeech` 目录下并重命名为 `DUMMY`。
+
+````markdown
 # ECTSpeech
 
 ## Prepare
@@ -7,7 +10,7 @@ Create and activate the conda environment:
 ```bash
 conda create -n Ectspeech python=3.8
 conda activate Ectspeech
-```
+````
 
 Install PyTorch with CUDA 12.1 support:
 
@@ -34,6 +37,11 @@ pip install tensorboard
 
 We use the LJSpeech dataset for training and tuning.
 
+Download the dataset from:
+[https://keithito.com/LJ-Speech-Dataset/](https://keithito.com/LJ-Speech-Dataset/)
+
+After downloading, place the dataset folder under the `ECTSpeech` root directory and rename it to `DUMMY`.
+
 Please prepare the dataset before running the training scripts.
 
 ## Pretraining
@@ -59,3 +67,5 @@ Run the inference script by providing the path to the text file, the checkpoint 
 ```bash
 python inference.py -f <text file> -c <checkpoint> -t <sampling steps>
 ```
+
+
