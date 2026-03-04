@@ -28,7 +28,7 @@ enc_dropout = 0.1
 n_heads = 2
 window_size = 4
 
-teacher = True    # true for teacher model, false for consistency tuning
+teacher = True    # true for Pre_model model, false for consistency tuning
 
 # ECT微调参数
 teacher_model_path = '/root/shared-nvme/ECT/ECTSpeech_V9/logs/pre_model/model_2070.pt'  # 预训练教师模型路径
